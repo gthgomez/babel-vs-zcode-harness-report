@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  report-integrity:
+    name: Report integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify FULL_REPORT.md is in sync with sources
+        run: |
+          bash scripts/assemble_full_report.sh
+          if ! git diff --quiet -- FULL_REPORT.md; then
+            git diff --stat -- FULL_REPORT.md
+            echo "::error::FULL_REPORT.md is stale. Run 'bash scripts/assemble_full_report.sh' and commit the result."
+            exit 1
+          fi
+
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
+
+      - name: Markdown lint
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
+        with:
+          # FULL_REPORT.md is intentionally excluded: scripts/assemble_full_report.sh
+          # generates it by concatenating README.md + reports/*.md, so the globs
+          # below already lint its content (and avoid double-reporting).
+          globs: |
+            README.md
+            reports/*.md

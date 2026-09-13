@@ -105,6 +105,12 @@ The fairest successor design is **ZCode's ergonomics with Babel's kernel**: low-
 - Executed gates: `babel-cli/src/executor/architectureConformance.test.ts` (23/23), `src/agent/episodeReplay.liveGolden.test.ts` (3/3), manual replication of `tools/check-harness-architecture.ps1` (all assertions hold; `pwsh` unavailable locally, so text assertions were checked with grep and file checks directly).
 - ZCode side: grounded in the operating environment this report was authored in (tool surface, permission model, subagent protocol, compaction, memory). No proprietary internals beyond what the agent itself can observe are reproduced.
 
+## 9. License
+
+This report is licensed under the [Creative Commons Attribution 4.0
+International License](https://creativecommons.org/licenses/by/4.0/) (CC BY 4.0).
+© 2026 Jonathan Gomez Aguilar. See [LICENSE](LICENSE) for the full legal code.
+
 ---
 
 # Completion Authority & Terminal Outcomes
