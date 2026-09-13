@@ -1,0 +1,13 @@
+{
+  // The report intentionally uses long single-line paragraphs (MD013),
+  // bolded lead-in pseudo-headings (MD036), unlabeled output fences (MD040),
+  // compact table pipes (MD060) and tight lists (MD032). Disable those so the
+  // intentionally-styled prose does not fail CI.
+  "config": {
+    "MD013": false,
+    "MD032": false,
+    "MD036": false,
+    "MD040": false,
+    "MD060": false
+  }
+}
